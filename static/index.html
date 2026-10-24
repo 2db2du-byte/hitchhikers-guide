@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="The Guide">
+<meta name="theme-color" content="#05070a">
+<title>The Guide</title>
+<link rel="icon" href="/icon.svg">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="manifest" href="/manifest.webmanifest" crossorigin="use-credentials">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/guide.css">
+</head>
+<body>
+<canvas id="stars" aria-hidden="true"></canvas>
+
+<!-- The cover -->
+<main id="home" class="screen on">
+  <header class="cover">
+    <p class="kicker">THE HITCHHIKER'S GUIDE TO THE GALAXY</p>
+    <h1 class="panic">DON'T PANIC</h1>
+    <p class="sub">in large, friendly letters · pick someone to talk to</p>
+  </header>
+  <section id="cast" class="cast" aria-label="Characters"></section>
+  <section class="shelf" aria-label="Other AIs on this iPad">
+    <span class="shelf-lbl">OTHER GUIDES ON THIS iPAD</span>
+    <a href="https://claude.ai/new" target="_blank" rel="noopener">Claude</a>
+    <a href="https://chatgpt.com/" target="_blank" rel="noopener">ChatGPT</a>
+    <a href="https://www.perplexity.ai/" target="_blank" rel="noopener">Perplexity</a>
+    <a href="https://grok.com/" target="_blank" rel="noopener">Grok</a>
+    <a href="https://chat.deepseek.com/" target="_blank" rel="noopener">DeepSeek</a>
+    <a href="https://poe.com/" target="_blank" rel="noopener">Poe</a>
+    <a href="https://www.meta.ai/" target="_blank" rel="noopener">Meta AI</a>
+    <a href="https://chat.mistral.ai/chat" target="_blank" rel="noopener">Mistral</a>
+  </section>
+  <footer class="foot">
+    <span id="local-state" class="pill">Local AIs: asleep</span>
+    <span class="pill">Everything runs on your PC · Tailscale keeps it private</span>
+    <span class="pill towel">🧺 Know where your towel is</span>
+  </footer>
+</main>
+
+<!-- One conversation -->
+<section id="chat" class="screen" aria-live="polite">
+  <header class="chat-head">
+    <button id="back" class="back" aria-label="Back to the Guide">◀ GUIDE</button>
+    <div id="who" class="who"></div>
+    <button id="clear" class="clear" title="Start a new conversation with this character">NEW CHAT</button>
+  </header>
+  <div id="log" class="log"></div>
+  <form id="ask" class="ask">
+    <textarea id="text" rows="1" placeholder="Ask anything…" autocomplete="off" enterkeyhint="send"></textarea>
+    <button id="send" type="submit">SEND</button>
+  </form>
+</section>
+
+<script src="/guide.js"></script>
+</body>
+</html>

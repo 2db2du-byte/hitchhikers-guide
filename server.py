@@ -11,8 +11,17 @@ with characters from the book. Each character is one of his AIs:
   Marvin            local, on the RTX 5060       (Ollama qwen3:8b, works with no internet)
   Ford Prefect      local, on the RTX 5060       (Ollama gemma3:4b, quick, works offline)
 
+The away team, on loan from the Enterprise (Rabbid's TNG crew, Claude agents in ~/.claude/agents).
+From the iPad they talk and read only (default permissions: nothing that needs approval runs):
+  Commander Riker   first officer, plans the job and says which officer to send
+  Wesley Crusher    Linux tutor
+  Guinan            the second brain (Obsidian notes)
+
+Plus the status strip (PC health, last backup, internet) and the ship's controls: a short fixed
+list of PC buttons (back up now, put the local AIs to sleep, lock the screen, say something).
+
 Who can get in: only this PC (127.0.0.1) and Rabbid's Tailscale devices (100.64.0.0/10),
-AND only with the Guide key. Open http://<your-tailscale-ip>:4200/?key=<key> once (key in
+AND only with the Guide key. Open http://<your-pc-tailscale-ip>:4200/?key=<key> once (key in
 ~/.config/guide/key); that sets a cookie, then Add to Home Screen.
 
   GET  /                    the Guide (static/index.html)
@@ -20,6 +29,8 @@ AND only with the Guide key. Open http://<your-tailscale-ip>:4200/?key=<key> onc
   GET  /api/chat/<id>       that character's conversation
   POST /api/chat/<id>       {"text": "..."} -> {"reply": "..."}
   POST /api/chat/<id>/clear start over with that character
+  GET  /api/status          temps, memory, drives, last backup, internet, local AIs
+  POST /api/do/<action>     backup | sleep-ai | lock | say {"text": "..."}
 POSTs need the header X-Guide: 42.
 """
 import ipaddress
@@ -27,6 +38,8 @@ import json
 import os
 import re
 import secrets
+import shutil
+import socket
 import subprocess
 import threading
 import time
@@ -45,6 +58,8 @@ BRAIN_KEY = (HOME / ".config/crew/brain-switch.key").read_text().strip()
 OLLAMA = "http://127.0.0.1:11434"
 CLAUDE = str(HOME / ".local/bin/claude")
 ALLOWED_NETS = [ipaddress.ip_network("127.0.0.0/8"), ipaddress.ip_network("100.64.0.0/10")]
+SAY = str(HOME / ".local/bin/say")
+SEAGATE = Path("/mnt/storage")
 HISTORY_SENT = 20  # how many past messages each character remembers per reply
 
 DATA.mkdir(parents=True, exist_ok=True)
@@ -96,8 +111,32 @@ CHARACTERS = {
                 "a bit of a party guy, very practical about survival. Short, quick answers. You live on "
                 "Rabbid's own PC, so you work even with no internet."),
 }
+CREW_NOTE = ("You're answering through the iPad Guide in talk-only mode: you can read and explain, but "
+             "anything that needs approval won't run from here. If a job needs doing on the PC, say exactly "
+             "what you'd do and tell Rabbid to hand it to the crew at the PC (the `riker` command).")
+CHARACTERS.update({
+    "riker": dict(
+        name="Commander Riker", brain="Claude crew", kind="claude", agent="riker",
+        where="first officer: plans the job, picks the officer",
+        quip="Number One. Sits on chairs backwards. Gets things done.", emoji="🎺", color="#ff6b5e",
+        persona=CREW_NOTE),
+    "wesley": dict(
+        name="Wesley Crusher", brain="Claude crew", kind="claude", agent="wesley",
+        where="your Linux tutor, one command at a time",
+        quip="Boy genius. Teaches Linux without making you feel dumb.", emoji="🐧", color="#ffc94a",
+        persona=CREW_NOTE),
+    "guinan": dict(
+        name="Guinan", brain="Claude crew", kind="claude", agent="guinan",
+        where="keeper of your second brain (Obsidian notes)",
+        quip="Runs Ten Forward. Remembers everything you tell her.", emoji="🍸", color="#c79bff",
+        persona=CREW_NOTE),
+})
 ORDER = ["deep-thought", "eddie", "trillian", "slartibartfast", "marvin", "ford"]
+CREW = ["riker", "wesley", "guinan"]
 locks = {cid: threading.Lock() for cid in CHARACTERS}
+claude_slots = threading.Semaphore(2)  # at most 2 Claude runs at once (16 GB of RAM)
+say_lock = threading.Lock()
+TALK_ONLY = "Bash Edit Write NotebookEdit WebFetch WebSearch mcp__*"
 
 
 def history_path(cid):
@@ -145,12 +184,19 @@ def wake_ollama():
 
 
 def ask_claude(ch, data, text):
-    cwd = DATA / "deep-thought"
+    cwd = DATA / ch.get("agent", "deep-thought")
     cwd.mkdir(exist_ok=True)
-    cmd = [CLAUDE, "-p", text, "--output-format", "json", "--append-system-prompt", COMMON + " " + ch["persona"]]
+    # Rabbid's text goes in on stdin, never in the argument list: a message starting with "--" would be read
+    # as a Claude option (Worf, 2026-10-26). Talk-only is also pinned here, whatever settings.json says.
+    cmd = [CLAUDE, "-p", "--output-format", "json", "--append-system-prompt", COMMON + " " + ch["persona"],
+           "--permission-mode", "default", "--disallowedTools", TALK_ONLY]
+    if ch.get("agent"):
+        cmd += ["--agent", ch["agent"]]
     if data.get("session"):
         cmd += ["--resume", data["session"]]
-    out = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=300)
+    with claude_slots:
+        out = subprocess.run(cmd, input=text, cwd=cwd, capture_output=True, text=True, timeout=300,
+                             env={**os.environ, "GUIDE": "1"})
     try:
         res = json.loads(out.stdout)
     except ValueError:
@@ -197,6 +243,136 @@ def reply(cid, text):
         return answer
 
 
+def sh(cmd, timeout=5):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def cpu_temp():
+    for hw in Path("/sys/class/hwmon").glob("hwmon*"):
+        try:
+            if (hw / "name").read_text().strip() == "k10temp":
+                return round(int((hw / "temp1_input").read_text()) / 1000)
+        except (OSError, ValueError):
+            pass
+    return None
+
+
+def last_backup():
+    """When Kopia last finished OK, whether the last run failed, and whether one is running now."""
+    when = None
+    for line in sh(["journalctl", "--user", "-u", "kopia-backup.service", "-n", "300", "-o", "json", "--no-pager"]).splitlines():
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if "Backup done" in str(e.get("MESSAGE", "")):
+            when = int(e["__REALTIME_TIMESTAMP"]) / 1e6
+    result = sh(["systemctl", "--user", "show", "kopia-backup.service", "-p", "Result", "--value"])
+    running = sh(["systemctl", "--user", "is-active", "kopia-backup.service"]) == "activating"
+    return {"when": when, "ok": result in ("success", ""), "running": running}
+
+
+def internet_up():
+    for host in ("1.1.1.1", "9.9.9.9"):
+        try:
+            socket.create_connection((host, 443), timeout=2).close()
+            return True
+        except OSError:
+            pass
+    return False
+
+
+status_cache = {"t": 0, "data": None}
+
+
+def status():
+    if time.time() - status_cache["t"] < 10:
+        return status_cache["data"]
+    mem = {}
+    for line in Path("/proc/meminfo").read_text().splitlines():
+        k, v = line.split(":")
+        mem[k] = int(v.split()[0]) / 1048576
+    gpu = sh(["nvidia-smi", "--query-gpu=temperature.gpu,utilization.gpu,memory.used,memory.total",
+              "--format=csv,noheader,nounits"]).split(", ")
+    data = {
+        "cpu_temp": cpu_temp(),
+        "gpu": {"temp": int(gpu[0]), "busy": int(gpu[1]), "vram": round(int(gpu[2]) / 1024, 1),
+                "vram_total": round(int(gpu[3]) / 1024)} if len(gpu) == 4 else None,
+        "ram": {"used": round(mem["MemTotal"] - mem["MemAvailable"], 1), "total": round(mem["MemTotal"])},
+        "nvme_free": round(shutil.disk_usage("/").free / 1e9),
+        "seagate": SEAGATE.is_mount(),
+        "backup": last_backup(),
+        "internet": internet_up(),
+        "local_awake": ollama_up(),
+        "now": time.time(),
+    }
+    status_cache.update(t=time.time(), data=data)
+    return data
+
+
+awake = {"proc": None, "t": 0}
+awake_lock = threading.Lock()
+
+
+def keep_awake():
+    """While Rabbid uses the Guide (e.g. from the couch), GNOME's 2-hour idle sleep must not kick in:
+    every use renews a 30-minute suspend inhibitor. The screen can still blank and lock."""
+    with awake_lock:
+        if time.time() - awake["t"] < 300 and awake["proc"] and awake["proc"].poll() is None:
+            return
+        old = awake["proc"]
+        awake["proc"] = subprocess.Popen(
+            ["gnome-session-inhibit", "--inhibit", "suspend", "--reason", "Rabbid is using the Guide on the iPad",
+             "sleep", "1800"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        awake["t"] = time.time()
+        if old and old.poll() is None:
+            old.terminate()
+            old.wait()
+
+
+def sleep_ai():
+    if ollama_up():
+        for line in sh(["ollama", "ps"], 10).splitlines()[1:]:
+            if line.strip():
+                sh(["ollama", "stop", line.split()[0]], 30)
+    sh(["systemctl", "--user", "stop", "crew-ollama.service"], 30)
+    return "The local AIs are asleep and the graphics card's memory is free. Picking Marvin or Ford wakes them."
+
+
+def do(action, body):
+    """The ship's controls: a short fixed list. Nothing else can be run from the iPad."""
+    status_cache["t"] = 0
+    if action == "backup":
+        if last_backup()["running"]:
+            return "A backup is already running."
+        sh(["systemctl", "--user", "start", "--no-block", "kopia-backup.service"])
+        return "Backup started. It usually takes under a minute; the strip shows the time when it's done."
+    if action == "sleep-ai":
+        return sleep_ai()
+    if action == "lock":
+        sh(["gdbus", "call", "--session", "--dest", "org.gnome.ScreenSaver", "--object-path", "/org/gnome/ScreenSaver",
+            "--method", "org.gnome.ScreenSaver.SetActive", "true"])
+        return "The PC screen is locked. Your password opens it."
+    if action == "say":
+        text = str(body.get("text", "")).strip()[:300]
+        if not text:
+            return "Nothing to say."
+        if not say_lock.acquire(blocking=False):
+            return "The PC is still talking. Try again in a moment."
+
+        def speak():
+            try:
+                sh([SAY, text], 120)
+            finally:
+                say_lock.release()
+        threading.Thread(target=speak, daemon=True).start()
+        return "The PC is saying it out loud."
+    raise KeyError(action)
+
+
 TYPES = {".html": "text/html; charset=utf-8", ".css": "text/css", ".js": "application/javascript",
          ".png": "image/png", ".svg": "image/svg+xml", ".json": "application/json",
          ".webmanifest": "application/manifest+json"}
@@ -205,6 +381,7 @@ PUBLIC = {"/icon.svg", "/apple-touch-icon.png", "/icon-512.png"}
 
 class Guide(BaseHTTPRequestHandler):
     server_version = "Guide/42"
+    timeout = 30  # a slow or stuck client can't hold a thread forever
 
     def log_message(self, fmt, *args):
         pass
@@ -219,9 +396,19 @@ class Guide(BaseHTTPRequestHandler):
     def has_key(self):
         for part in (self.headers.get("Cookie") or "").split(";"):
             k, _, v = part.strip().partition("=")
-            if k == "guide" and secrets.compare_digest(v, GUIDE_KEY):
+            if k == "guide" and secrets.compare_digest(v.encode(), GUIDE_KEY.encode()):
                 return True
         return False
+
+    def read_body(self, limit):
+        """A JSON object from the request, or ValueError. Bad lengths and non-objects count as bad."""
+        size = int(self.headers.get("Content-Length") or 0)
+        if not 0 <= size <= limit:
+            raise ValueError("bad length")
+        body = json.loads(self.rfile.read(size) or b"{}")
+        if not isinstance(body, dict):
+            raise ValueError("not an object")
+        return body
 
     def send(self, code, body, ctype="application/json", extra=()):
         if not isinstance(body, bytes):
@@ -231,6 +418,9 @@ class Guide(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline' "
+                         "https://fonts.googleapis.com; font-src https://fonts.gstatic.com; frame-ancestors 'none'")
         for k, v in extra:
             self.send_header(k, v)
         self.end_headers()
@@ -241,7 +431,7 @@ class Guide(BaseHTTPRequestHandler):
             return self.send(403, {"error": "not on Rabbid's network"})
         url = urlparse(self.path)
         if url.path == "/" and "key" in parse_qs(url.query):
-            if secrets.compare_digest(parse_qs(url.query)["key"][0], GUIDE_KEY):
+            if secrets.compare_digest(parse_qs(url.query)["key"][0].encode(), GUIDE_KEY.encode()):
                 cookie = f"guide={GUIDE_KEY}; Path=/; Max-Age=315360000; HttpOnly; SameSite=Strict"
                 # serve the page right here (no redirect) so "Add to Home Screen" keeps the key in its link:
                 # the iPad's home-screen app has its own cookie jar and needs the key on its first launch
@@ -252,14 +442,18 @@ class Guide(BaseHTTPRequestHandler):
                     b"color:#9be36b;font:24px sans-serif;text-align:center;padding:60px'><h1>DON'T PANIC</h1>"
                     b"<p>This Guide needs its key. Ask Claude for your Guide link.</p>")
             return self.send(401, page, "text/html; charset=utf-8")
+        if url.path.startswith("/api/"):
+            keep_awake()
         if url.path == "/api/characters":
             out = []
-            for cid in ORDER:
+            for cid in ORDER + CREW:
                 ch = CHARACTERS[cid]
                 msgs = load(cid)["messages"]
                 out.append({"id": cid, **{k: ch[k] for k in ("name", "brain", "kind", "where", "quip", "emoji", "color")},
-                            "count": len(msgs), "last": msgs[-1]["text"][:90] if msgs else ""})
+                            "count": len(msgs), "last": msgs[-1]["text"][:90] if msgs else "", "crew": cid in CREW})
             return self.send(200, {"characters": out, "local_awake": ollama_up()})
+        if url.path == "/api/status":
+            return self.send(200, status())
         if url.path == "/manifest.webmanifest":
             manifest = json.loads((STATIC / "manifest.webmanifest").read_text())
             manifest["start_url"] = "/?key=" + GUIDE_KEY
@@ -276,7 +470,18 @@ class Guide(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self.allowed_ip() or not self.has_key() or self.headers.get("X-Guide") != "42":
             return self.send(403, {"error": "no"})
-        m = re.fullmatch(r"/api/chat/([a-z-]+)(/clear)?", urlparse(self.path).path)
+        keep_awake()
+        path = urlparse(self.path).path
+        a = re.fullmatch(r"/api/do/([a-z-]+)", path)
+        if a:
+            try:
+                body = self.read_body(2000)
+                return self.send(200, {"done": do(a.group(1), body)})
+            except KeyError:
+                return self.send(404, {"error": "no such control"})
+            except Exception as e:
+                return self.send(502, {"error": f"That didn't work: {e}"})
+        m = re.fullmatch(r"/api/chat/([a-z-]+)(/clear)?", path)
         if not m or m.group(1) not in CHARACTERS:
             return self.send(404, {"error": "not found"})
         cid = m.group(1)
@@ -285,8 +490,7 @@ class Guide(BaseHTTPRequestHandler):
                 save(cid, {"messages": [], "session": None})
             return self.send(200, {"ok": True})
         try:
-            body = json.loads(self.rfile.read(min(int(self.headers.get("Content-Length") or 0), 20000)) or b"{}")
-            text = str(body.get("text", "")).strip()[:8000]
+            text = str(self.read_body(20000).get("text", "")).strip()[:8000]
         except ValueError:
             return self.send(400, {"error": "bad request"})
         if not text:

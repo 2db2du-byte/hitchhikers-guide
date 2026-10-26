@@ -22,12 +22,23 @@
 
 <!-- The cover -->
 <main id="home" class="screen on">
+  <section id="status" class="status" aria-label="How the PC is doing"><span class="stat">Checking the PC…</span></section>
   <header class="cover">
     <p class="kicker">THE HITCHHIKER'S GUIDE TO THE GALAXY</p>
     <h1 class="panic">DON'T PANIC</h1>
     <p class="sub">in large, friendly letters · pick someone to talk to</p>
   </header>
   <section id="cast" class="cast" aria-label="Characters"></section>
+  <span class="row-lbl">THE AWAY TEAM · ON LOAN FROM THE ENTERPRISE · TALK ONLY</span>
+  <section id="crew" class="cast crew" aria-label="Crew"></section>
+  <span class="row-lbl">SHIP'S CONTROLS · YOUR PC</span>
+  <section class="controls" aria-label="PC buttons">
+    <button data-do="backup" data-ask="Back up the PC now?">💾 Back up now</button>
+    <button data-do="sleep-ai" data-ask="Put the local AIs to sleep and free the graphics card?">💤 Local AIs to sleep</button>
+    <button data-do="lock" data-ask="Lock the PC screen?">🔒 Lock the PC</button>
+    <button data-do="say">📢 Say it on the PC</button>
+  </section>
+  <div id="toast" class="toast" role="status"></div>
   <section class="shelf" aria-label="Other AIs on this iPad">
     <span class="shelf-lbl">OTHER GUIDES ON THIS iPAD</span>
     <a href="https://claude.ai/new" target="_blank" rel="noopener">Claude</a>
@@ -40,7 +51,6 @@
     <a href="https://chat.mistral.ai/chat" target="_blank" rel="noopener">Mistral</a>
   </section>
   <footer class="foot">
-    <span id="local-state" class="pill">Local AIs: asleep</span>
     <span class="pill">Everything runs on your PC · Tailscale keeps it private</span>
     <span class="pill towel">🧺 Know where your towel is</span>
   </footer>
